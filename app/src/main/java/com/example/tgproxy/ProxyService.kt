@@ -7,8 +7,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.security.SecureRandom
@@ -20,6 +22,8 @@ object ProxyState {
 
 class ProxyService : Service() {
     private var server: MtProxyServer? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -29,9 +33,8 @@ class ProxyService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "Прокси", NotificationManager.IMPORTANCE_LOW)
-        )
+        val channel = NotificationChannel(CHANNEL_ID, "Прокси", NotificationManager.IMPORTANCE_LOW)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("TG WS Proxy работает")
             .setContentText("Прокси для Telegram: 127.0.0.1:$PORT")
@@ -45,25 +48,51 @@ class ProxyService : Service() {
         } else {
             startForeground(NOTIF_ID, notification)
         }
+        if (server == null) startProxy()
+        // START_STICKY: если система убьёт службу, она запустится снова сама
+        return START_STICKY
+    }
 
-        if (server == null) {
-            val srv = MtProxyServer(PORT, hexToBytes(secretHex(this))) { ProxyState.message.value = it }
-            try {
-                srv.start()
-                server = srv
-                ProxyState.running.value = true
-                ProxyState.message.value = "Слушает 127.0.0.1:$PORT"
-            } catch (e: Exception) {
-                ProxyState.message.value = "Порт $PORT недоступен: ${e.message}"
-                stopSelf()
-            }
+    private fun startProxy() {
+        acquireLocks()
+        val srv = MtProxyServer(PORT, hexToBytes(secretHex(this))) { ProxyState.message.value = it }
+        try {
+            srv.start()
+            server = srv
+            ProxyState.running.value = true
+            ProxyState.message.value = "Слушает 127.0.0.1:$PORT"
+        } catch (e: Exception) {
+            ProxyState.message.value = "Порт $PORT недоступен: ${e.message}"
+            releaseLocks()
+            stopSelf()
         }
-        return START_NOT_STICKY
+    }
+
+    // Не даём процессору и Wi-Fi уснуть, пока работает прокси
+    private fun acquireLocks() {
+        if (wakeLock == null) {
+            wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TgWsProxy:cpu")
+                .apply { setReferenceCounted(false); acquire() }
+        }
+        if (wifiLock == null) {
+            wifiLock = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
+                .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "TgWsProxy:wifi")
+                .apply { setReferenceCounted(false); acquire() }
+        }
+    }
+
+    private fun releaseLocks() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+        wifiLock = null
     }
 
     private fun stopProxy() {
         server?.stop()
         server = null
+        releaseLocks()
         ProxyState.running.value = false
         ProxyState.message.value = "Остановлен"
     }
