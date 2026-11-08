@@ -9,6 +9,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -28,11 +30,17 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+
+object BatteryState {
+    var ignoring by mutableStateOf(false)
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -45,6 +53,12 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        BatteryState.ignoring = getSystemService(PowerManager::class.java)
+            .isIgnoringBatteryOptimizations(packageName)
+    }
 }
 
 @Composable
@@ -52,6 +66,7 @@ fun ProxyScreen() {
     val context = LocalContext.current
     val running by ProxyState.running.collectAsState()
     val message by ProxyState.message.collectAsState()
+    val ignoring = BatteryState.ignoring
     val link = ProxyService.proxyLink(context)
     val askNotif = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     val buttonModifier = Modifier.fillMaxWidth(0.8f).widthIn(max = 360.dp)
@@ -96,5 +111,21 @@ fun ProxyScreen() {
             },
             modifier = buttonModifier.padding(top = 12.dp)
         ) { Text("Скопировать ссылку") }
+
+        OutlinedButton(
+            onClick = {
+                if (!ignoring) {
+                    try {
+                        context.startActivity(
+                            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:" + context.packageName))
+                        )
+                    } catch (e: ActivityNotFoundException) {
+                        Toast.makeText(context, "Откройте настройки батареи вручную", Toast.LENGTH_LONG).show()
+                    }
+                }
+            },
+            modifier = buttonModifier.padding(top = 12.dp)
+        ) { Text(if (ignoring) "Работа в фоне разрешена" else "Разрешить работу в фоне") }
     }
 }
