@@ -66,21 +66,25 @@ class MtProxyServer(
     private val secret: ByteArray,
     private val log: (String) -> Unit
 ) {
-    private val pool = Executors.newCachedThreadPool()
+    private var pool = Executors.newCachedThreadPool()
     private val sockets = ConcurrentHashMap.newKeySet<Socket>()
     private val rnd = SecureRandom()
     private val http = OkHttpClient.Builder()
         .dns(telegramDns)
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
     private var server: ServerSocket? = null
 
     // true: в следующий раз сначала пробуем путь B, потому что путь A только что оборвался
     @Volatile private var tcpFirst = false
+    @Volatile private var tcpFirstSince = 0L
 
     fun start() {
+        pool = Executors.newCachedThreadPool()
         val ss = ServerSocket()
         ss.reuseAddress = true
         ss.bind(InetSocketAddress("127.0.0.1", port))
@@ -103,6 +107,7 @@ class MtProxyServer(
         sockets.forEach { runCatching { it.close() } }
         sockets.clear()
         pool.shutdownNow()
+        runCatching { pool.awaitTermination(2, TimeUnit.SECONDS) }
     }
 
     private fun handle(client: Socket) {
@@ -110,6 +115,7 @@ class MtProxyServer(
         var tcp: Socket? = null
         try {
             client.tcpNoDelay = true
+            client.soTimeout = 10000
             val input = client.getInputStream()
 
             // 1. Рукопожатие клиента: ключ, IV, тип протокола и номер DC
@@ -131,6 +137,7 @@ class MtProxyServer(
                 return
             }
             log("Telegram подключился, DC $dc")
+            client.soTimeout = 0
 
             // 2. Своё рукопожатие к серверу Telegram (без секрета)
             val raw = randomInit(tag, dcIdx)
@@ -147,7 +154,7 @@ class MtProxyServer(
 
             // 4. Путь A: WebSocket
             val up = Upstream(client, cliEnc, tgDec)
-            if (!tcpFirst) {
+            if (tcpFirst && System.currentTimeMillis() - tcpFirstSince < 5 * 60_000) {
                 log("Путь A: WebSocket к DC $wsDc...")
                 val socket = connectWs(wsDc, media, up)
                 if (socket != null) {
@@ -155,9 +162,14 @@ class MtProxyServer(
                     socket.send(handshake.toByteString())
                     log("Путь A: связь установлена, жду ответ Telegram")
                     try {
-                        pump(input, clientDec, tgEnc) { socket.send(it.toByteString()) }
+                        pump(input, clientDec, tgEnc) { data ->
+                            if (!socket.send(data.toByteString())) {
+                                throw SocketException("WS-очередь переполнена или закрыта")
+                            }
+                        }
                     } finally {
                         tcpFirst = !up.gotData
+                        tcpFirstSince = System.currentTimeMillis()
                     }
                     return
                 }
@@ -238,7 +250,7 @@ class MtProxyServer(
     }
 
     private fun connectWs(dc: Int, media: Boolean, up: Upstream): WebSocket? {
-        val hosts = if (media) listOf("kws$dc-1", "kws$dc") else listOf("kws$dc", "kws$dc-1")
+        val hosts = if (media) listOf("kwsdc−1","kwsdc-1", "kwsdc−1","kwsdc") else listOf("kwsdc","kwsdc", "kwsdc","kwsdc-1")
         for (host in hosts) {
             val req = Request.Builder()
                 .url("https://$host.web.telegram.org/apiws")
@@ -286,17 +298,22 @@ class MtProxyServer(
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             opened.countDown()
+            val reason = t.message ?: when (t) {
+                is java.io.IOException -> "сеть недоступна"
+                is java.net.SocketTimeoutException -> "таймаут соединения"
+                else -> t.javaClass.simpleName
+            }
             if (isOpen) {
-                log("Сервер Telegram оборвал связь: ${t.message}")
+                log("Сервер Telegram оборвал связь: $reason")
                 runCatching { client.close() }
             } else {
-                log("Нет связи с сервером Telegram: ${t.message}")
+                log("Нет связи с сервером Telegram: $reason")
             }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (isOpen) {
-                log("Сервер Telegram закрыл связь: код $code, $reason")
+                log("Сервер Telegram закрыл связь: код code,code,code,reason")
                 runCatching { client.close() }
             }
         }
@@ -307,33 +324,6 @@ class MtProxyServer(
             val b = ByteArray(64).also { rnd.nextBytes(it) }
             val first4 = b.copyOfRange(0, 4)
             val reserved = b[0] == 0xEF.toByte() ||
-                first4.contentEquals(TAG_INTERMEDIATE) || first4.contentEquals(TAG_PADDED) ||
-                String(first4, Charsets.ISO_8859_1) in setOf("POST", "GET ", "HEAD", "\u0016\u0003\u0001\u0002") ||
-                b.copyOfRange(4, 8).all { it == 0.toByte() }
-            if (reserved) continue
-            tag.copyInto(b, 56)
-            b[60] = (dcIdx and 0xff).toByte()
-            b[61] = ((dcIdx shr 8) and 0xff).toByte()
-            return b
-        }
-    }
+                first4
 
-    private fun aes(key: ByteArray, iv: ByteArray): Cipher =
-        Cipher.getInstance("AES/CTR/NoPadding").apply {
-            init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-        }
-
-    private fun mtKey(seed: ByteArray): ByteArray =
-        MessageDigest.getInstance("SHA-256").digest(seed + secret)
-}
-
-private fun InputStream.readExactly(n: Int): ByteArray {
-    val b = ByteArray(n)
-    var off = 0
-    while (off < n) {
-        val r = read(b, off, n - off)
-        if (r < 0) throw EOFException("Соединение закрыто")
-        off += r
-    }
-    return b
-}
+> ⚠️ The response reached the length limit. Reply **continue** to get the rest.
