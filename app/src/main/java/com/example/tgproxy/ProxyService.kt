@@ -115,7 +115,7 @@ class ProxyService : Service() {
                 .also { prefs.edit().putString("secret", it).apply() }
         }
 
-        fun proxyLink(ctx: Context) = "tg://proxy?server=127.0.0.1&port=$PORT&secret=dd" + secretHex(ctx)
+        fun proxyLink(ctx: Context) = "tg://proxy?server=127.0.0.1&port=$PORT&secret=" + secretHex(ctx)
 
         fun hexToBytes(hex: String) = ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
     }
