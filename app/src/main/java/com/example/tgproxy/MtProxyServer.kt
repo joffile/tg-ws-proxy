@@ -14,6 +14,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketException
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
@@ -29,9 +30,8 @@ private val TAG_INTERMEDIATE = ByteArray(4) { 0xEE.toByte() }
 private val TAG_PADDED = ByteArray(4) { 0xDD.toByte() }
 private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
-// Адреса серверов Telegram по номеру DC, как в tg-ws-proxy-rs.
-// Подключаемся по IP, а не по имени: так обходятся DNS-блокировки.
-private val DC_IPS = mapOf(
+// Путь A (WebSocket): адреса для kwsN.web.telegram.org, пробуются по очереди
+private val WS_IPS = mapOf(
     1 to listOf("149.154.175.50", "149.154.175.205", "149.154.174.100"),
     2 to listOf("149.154.167.220", "149.154.167.51"),
     3 to listOf("149.154.175.100", "149.154.174.100"),
@@ -39,20 +39,27 @@ private val DC_IPS = mapOf(
     5 to listOf("149.154.171.5", "91.108.56.130", "149.154.170.100")
 )
 
-// Имя kws2.web.telegram.org превращаем в IP сервера DC 2, TLS-имя остаётся прежним
+// Путь B (прямой TCP на сервер датацентра, без WebSocket): адреса из default_dc_ips
+private val TCP_IPS = mapOf(
+    1 to "149.154.175.50",
+    2 to "149.154.167.51",
+    3 to "149.154.175.100",
+    4 to "149.154.167.91",
+    5 to "149.154.171.5",
+    203 to "91.105.192.100"
+)
+
 private val telegramDns = object : Dns {
     override fun lookup(hostname: String): List<InetAddress> {
         val dc = Regex("kws(\\d+)").find(hostname)?.groupValues?.get(1)?.toIntOrNull()
-        val ips = dc?.let { DC_IPS[it] }
+        val ips = dc?.let { WS_IPS[it] }
         return if (ips != null) ips.map { InetAddress.getByName(it) } else Dns.SYSTEM.lookup(hostname)
     }
 }
 
 /**
- * Локальный прокси для Telegram (протокол MTProto obfuscated2).
- * Принимает Telegram на 127.0.0.1 и пересылает трафик через WebSocket
- * на серверы Telegram (wss://kwsN.web.telegram.org/apiws).
- * Текущий этап работы пишется в статус приложения через log().
+ * Локальный прокси для Telegram (MTProto obfuscated2).
+ * Сначала путь A (WebSocket), если он не работает, путь B (прямой TCP).
  */
 class MtProxyServer(
     private val port: Int,
@@ -69,6 +76,9 @@ class MtProxyServer(
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
     private var server: ServerSocket? = null
+
+    // true: в следующий раз сначала пробуем путь B, потому что путь A только что оборвался
+    @Volatile private var tcpFirst = false
 
     fun start() {
         val ss = ServerSocket()
@@ -97,11 +107,12 @@ class MtProxyServer(
 
     private fun handle(client: Socket) {
         var ws: WebSocket? = null
+        var tcp: Socket? = null
         try {
             client.tcpNoDelay = true
             val input = client.getInputStream()
 
-            // 1. 64 байта рукопожатия клиента: ключ, IV, тип протокола и номер DC
+            // 1. Рукопожатие клиента: ключ, IV, тип протокола и номер DC
             val hs = input.readExactly(64)
             val clientDec = aes(mtKey(hs.copyOfRange(8, 40)), hs.copyOfRange(40, 56))
             val plain = clientDec.update(hs)
@@ -130,40 +141,99 @@ class MtProxyServer(
             for (i in 56 until 64) handshake[i] = (raw[i].toInt() xor keystream[i].toInt()).toByte()
             val tgDec = aes(rawRev.copyOfRange(8, 40), rawRev.copyOfRange(40, 56))
 
-            // 3. Ответы клиенту шифруем ключами из его рукопожатия, в обратном порядке
+            // 3. Ответы клиенту шифруем ключами из его рукопожатия
             val rev = hs.reversedArray()
             val cliEnc = aes(mtKey(rev.copyOfRange(8, 40)), rev.copyOfRange(40, 56))
 
-            // 4. WebSocket к серверам Telegram и отправка своего рукопожатия
+            // 4. Путь A: WebSocket
             val up = Upstream(client, cliEnc, tgDec)
-            log("Подключаюсь к серверам Telegram, DC $wsDc...")
-            val socket = connectWs(wsDc, media, up)
-            if (socket == null) {
-                log("Серверы Telegram недоступны (DC $dc)")
+            if (!tcpFirst) {
+                log("Путь A: WebSocket к DC $wsDc...")
+                val socket = connectWs(wsDc, media, up)
+                if (socket != null) {
+                    ws = socket
+                    socket.send(handshake.toByteString())
+                    log("Путь A: связь установлена, жду ответ Telegram")
+                    try {
+                        pump(input, clientDec, tgEnc) { socket.send(it.toByteString()) }
+                    } finally {
+                        tcpFirst = !up.gotData
+                    }
+                    return
+                }
+                log("Путь A не работает, пробую путь B")
+            }
+
+            // 5. Путь B: прямое TCP-соединение с сервером датацентра
+            log("Путь B: прямое соединение с DC $dc...")
+            val remote = connectTcp(dc)
+            if (remote == null) {
+                log("Все пути закрыты: WebSocket и TCP не работают")
+                tcpFirst = false
                 return
             }
-            ws = socket
-            socket.send(handshake.toByteString())
-            log("Связь с серверами установлена, жду ответ Telegram")
-
-            // 5. Клиент -> Telegram
-            val buf = ByteArray(16 * 1024)
-            while (true) {
-                val n = input.read(buf)
-                if (n < 0) break
-                val chunk = clientDec.update(buf.copyOf(n)) ?: continue
-                if (!socket.send(tgEnc.update(chunk).toByteString())) break
-            }
+            tcp = remote
+            remote.getOutputStream().apply { write(handshake); flush() }
+            log("Путь B: соединение установлено, жду ответ Telegram")
+            tcpFirst = false
+            startTcpReader(remote, client, tgDec, cliEnc)
+            pump(input, clientDec, tgEnc) { remote.getOutputStream().apply { write(it); flush() } }
         } catch (e: EOFException) {
             // клиент закрыл соединение
-        } catch (e: java.net.SocketException) {
-            // связь закрыта, причина уже записана в статус
+        } catch (e: SocketException) {
+            // связь закрыта, причина уже в статусе
         } catch (e: Exception) {
             log("Ошибка: ${e.message}")
         } finally {
             ws?.close(1000, null)
+            tcp?.let { runCatching { it.close() } }
             runCatching { client.close() }
             sockets.remove(client)
+        }
+    }
+
+    // Читает данные клиента, расшифровывает, шифрует для Telegram и отправляет
+    private fun pump(input: InputStream, clientDec: Cipher, tgEnc: Cipher, send: (ByteArray) -> Unit) {
+        val buf = ByteArray(16 * 1024)
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            val chunk = clientDec.update(buf.copyOf(n)) ?: continue
+            send(tgEnc.update(chunk) ?: continue)
+        }
+    }
+
+    // Читает ответы из прямого TCP-соединения и передаёт их клиенту
+    private fun startTcpReader(remote: Socket, client: Socket, tgDec: Cipher, cliEnc: Cipher) {
+        pool.execute {
+            try {
+                val tin = remote.getInputStream()
+                val buf = ByteArray(16 * 1024)
+                while (true) {
+                    val n = tin.read(buf)
+                    if (n < 0) break
+                    val dec = tgDec.update(buf.copyOf(n)) ?: continue
+                    val out = cliEnc.update(dec) ?: continue
+                    client.getOutputStream().apply { write(out); flush() }
+                }
+            } catch (e: Exception) {
+                // соединение закрыто
+            } finally {
+                runCatching { client.close() }
+            }
+        }
+    }
+
+    private fun connectTcp(dc: Int): Socket? {
+        val ip = TCP_IPS[dc] ?: return null
+        return try {
+            Socket().apply {
+                tcpNoDelay = true
+                connect(InetSocketAddress(ip, 443), 5000)
+            }
+        } catch (e: Exception) {
+            log("Путь B: сервер $ip не отвечает")
+            null
         }
     }
 
@@ -191,7 +261,7 @@ class MtProxyServer(
     ) : WebSocketListener() {
         val opened = CountDownLatch(1)
         @Volatile var isOpen = false
-        private var gotData = false
+        @Volatile var gotData = false
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
             isOpen = true
