@@ -1,5 +1,6 @@
 package com.example.tgproxy
 
+import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -9,6 +10,7 @@ import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.io.EOFException
 import java.io.InputStream
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -27,10 +29,30 @@ private val TAG_INTERMEDIATE = ByteArray(4) { 0xEE.toByte() }
 private val TAG_PADDED = ByteArray(4) { 0xDD.toByte() }
 private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
+// Адреса серверов Telegram по номеру DC, как в tg-ws-proxy-rs.
+// Подключаемся по IP, а не по имени: так обходятся DNS-блокировки.
+private val DC_IPS = mapOf(
+    1 to "149.154.175.50",
+    2 to "149.154.167.220",
+    3 to "149.154.175.100",
+    4 to "149.154.167.220",
+    5 to "149.154.171.5"
+)
+
+// Имя kws2.web.telegram.org превращаем в IP сервера DC 2, TLS-имя остаётся прежним
+private val telegramDns = object : Dns {
+    override fun lookup(hostname: String): List<InetAddress> {
+        val dc = Regex("kws(\\d+)").find(hostname)?.groupValues?.get(1)?.toIntOrNull()
+        val ip = dc?.let { DC_IPS[it] }
+        return if (ip != null) listOf(InetAddress.getByName(ip)) else Dns.SYSTEM.lookup(hostname)
+    }
+}
+
 /**
  * Локальный прокси для Telegram (протокол MTProto obfuscated2).
  * Принимает Telegram на 127.0.0.1 и пересылает трафик через WebSocket
  * на серверы Telegram (wss://kwsN.web.telegram.org/apiws).
+ * Текущий этап работы пишется в статус приложения через log().
  */
 class MtProxyServer(
     private val port: Int,
@@ -41,6 +63,7 @@ class MtProxyServer(
     private val sockets = ConcurrentHashMap.newKeySet<Socket>()
     private val rnd = SecureRandom()
     private val http = OkHttpClient.Builder()
+        .dns(telegramDns)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
         .build()
@@ -84,7 +107,7 @@ class MtProxyServer(
             val tag = plain.copyOfRange(56, 60)
             if (!tag.contentEquals(TAG_ABRIDGED) && !tag.contentEquals(TAG_INTERMEDIATE) &&
                 !tag.contentEquals(TAG_PADDED)) {
-                log("Неверный секрет в ссылке прокси")
+                log("Неверный секрет: удалите старый прокси в Telegram и подключите заново")
                 return
             }
             val dcIdx = ((plain[60].toInt() and 0xff) or (plain[61].toInt() shl 8)).toShort().toInt()
@@ -95,6 +118,7 @@ class MtProxyServer(
                 log("Неизвестный номер DC: $dc")
                 return
             }
+            log("Telegram подключился, DC $dc")
 
             // 2. Своё рукопожатие к серверу Telegram (без секрета)
             val raw = randomInit(tag, dcIdx)
@@ -109,8 +133,9 @@ class MtProxyServer(
             val rev = hs.reversedArray()
             val cliEnc = aes(mtKey(rev.copyOfRange(8, 40)), rev.copyOfRange(40, 56))
 
-            // 4. WebSocket к Telegram и отправка своего рукопожатия
+            // 4. WebSocket к серверам Telegram и отправка своего рукопожатия
             val up = Upstream(client, cliEnc, tgDec)
+            log("Подключаюсь к серверам Telegram, DC $wsDc...")
             val socket = connectWs(wsDc, media, up)
             if (socket == null) {
                 log("Серверы Telegram недоступны (DC $dc)")
@@ -118,8 +143,9 @@ class MtProxyServer(
             }
             ws = socket
             socket.send(handshake.toByteString())
+            log("Связь с серверами установлена, жду ответ Telegram")
 
-            // 5. Перекачка данных: клиент -> Telegram
+            // 5. Клиент -> Telegram
             val buf = ByteArray(16 * 1024)
             while (true) {
                 val n = input.read(buf)
@@ -127,8 +153,10 @@ class MtProxyServer(
                 val chunk = clientDec.update(buf.copyOf(n)) ?: continue
                 if (!socket.send(tgEnc.update(chunk).toByteString())) break
             }
+        } catch (e: EOFException) {
+            // клиент закрыл соединение
         } catch (e: Exception) {
-            // обычное закрытие соединения, в журнал не пишем
+            log("Ошибка: ${e.message}")
         } finally {
             ws?.close(1000, null)
             runCatching { client.close() }
@@ -160,6 +188,7 @@ class MtProxyServer(
     ) : WebSocketListener() {
         val opened = CountDownLatch(1)
         @Volatile var isOpen = false
+        private var gotData = false
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
             isOpen = true
@@ -167,11 +196,16 @@ class MtProxyServer(
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (!gotData) {
+                gotData = true
+                log("Telegram отвечает, соединение рабочее")
+            }
             try {
                 val plain = tgDec.update(bytes.toByteArray()) ?: return
                 val out = cliEnc.update(plain) ?: return
                 client.getOutputStream().apply { write(out); flush() }
             } catch (e: Exception) {
+                log("Ошибка данных: ${e.message}")
                 webSocket.close(1000, null)
                 runCatching { client.close() }
             }
@@ -179,7 +213,11 @@ class MtProxyServer(
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             opened.countDown()
-            if (isOpen) runCatching { client.close() }
+            if (isOpen) {
+                runCatching { client.close() }
+            } else {
+                log("Нет связи с сервером Telegram: ${t.message}")
+            }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
