@@ -32,19 +32,19 @@ private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTM
 // Адреса серверов Telegram по номеру DC, как в tg-ws-proxy-rs.
 // Подключаемся по IP, а не по имени: так обходятся DNS-блокировки.
 private val DC_IPS = mapOf(
-    1 to "149.154.175.50",
-    2 to "149.154.167.220",
-    3 to "149.154.175.100",
-    4 to "149.154.167.220",
-    5 to "149.154.171.5"
+    1 to listOf("149.154.175.50", "149.154.175.205", "149.154.174.100"),
+    2 to listOf("149.154.167.220", "149.154.167.51"),
+    3 to listOf("149.154.175.100", "149.154.174.100"),
+    4 to listOf("149.154.167.220", "149.154.167.91"),
+    5 to listOf("149.154.171.5", "91.108.56.130", "149.154.170.100")
 )
 
 // Имя kws2.web.telegram.org превращаем в IP сервера DC 2, TLS-имя остаётся прежним
 private val telegramDns = object : Dns {
     override fun lookup(hostname: String): List<InetAddress> {
         val dc = Regex("kws(\\d+)").find(hostname)?.groupValues?.get(1)?.toIntOrNull()
-        val ip = dc?.let { DC_IPS[it] }
-        return if (ip != null) listOf(InetAddress.getByName(ip)) else Dns.SYSTEM.lookup(hostname)
+        val ips = dc?.let { DC_IPS[it] }
+        return if (ips != null) ips.map { InetAddress.getByName(it) } else Dns.SYSTEM.lookup(hostname)
     }
 }
 
@@ -64,7 +64,7 @@ class MtProxyServer(
     private val rnd = SecureRandom()
     private val http = OkHttpClient.Builder()
         .dns(telegramDns)
-        .connectTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
