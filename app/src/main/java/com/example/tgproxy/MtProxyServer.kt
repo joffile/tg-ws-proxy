@@ -1,269 +1,122 @@
 package com.example.tgproxy
 
-import okhttp3.Dns
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import okio.ByteString
-import okio.ByteString.Companion.toByteString
-import java.io.EOFException
-import java.io.InputStream
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.ServerSocket
-import java.net.Socket
-import java.security.MessageDigest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.flow.MutableStateFlow
 import java.security.SecureRandom
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
-private val TAG_ABRIDGED = ByteArray(4) { 0xEF.toByte() }
-private val TAG_INTERMEDIATE = ByteArray(4) { 0xEE.toByte() }
-private val TAG_PADDED = ByteArray(4) { 0xDD.toByte() }
-private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-
-// Адреса серверов Telegram по номеру DC, как в tg-ws-proxy-rs.
-// Подключаемся по IP, а не по имени: так обходятся DNS-блокировки.
-private val DC_IPS = mapOf(
-    1 to "149.154.175.50",
-    2 to "149.154.167.220",
-    3 to "149.154.175.100",
-    4 to "149.154.167.220",
-    5 to "149.154.171.5"
-)
-
-// Имя kws2.web.telegram.org превращаем в IP сервера DC 2, TLS-имя остаётся прежним
-private val telegramDns = object : Dns {
-    override fun lookup(hostname: String): List<InetAddress> {
-        val dc = Regex("kws(\\d+)").find(hostname)?.groupValues?.get(1)?.toIntOrNull()
-        val ip = dc?.let { DC_IPS[it] }
-        return if (ip != null) listOf(InetAddress.getByName(ip)) else Dns.SYSTEM.lookup(hostname)
-    }
+object ProxyState {
+    val running = MutableStateFlow(false)
+    val message = MutableStateFlow("Остановлен")
 }
 
-/**
- * Локальный прокси для Telegram (протокол MTProto obfuscated2).
- * Принимает Telegram на 127.0.0.1 и пересылает трафик через WebSocket
- * на серверы Telegram (wss://kwsN.web.telegram.org/apiws).
- * Текущий этап работы пишется в статус приложения через log().
- */
-class MtProxyServer(
-    private val port: Int,
-    private val secret: ByteArray,
-    private val log: (String) -> Unit
-) {
-    private val pool = Executors.newCachedThreadPool()
-    private val sockets = ConcurrentHashMap.newKeySet<Socket>()
-    private val rnd = SecureRandom()
-    private val http = OkHttpClient.Builder()
-        .dns(telegramDns)
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
-        .build()
-    private var server: ServerSocket? = null
+class ProxyService : Service() {
+    private var server: MtProxyServer? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
-    fun start() {
-        val ss = ServerSocket()
-        ss.reuseAddress = true
-        ss.bind(InetSocketAddress("127.0.0.1", port))
-        server = ss
-        pool.execute {
-            while (!ss.isClosed) {
-                try {
-                    val client = ss.accept()
-                    sockets.add(client)
-                    pool.execute { handle(client) }
-                } catch (e: Exception) {
-                    if (!ss.isClosed) log("Ошибка приёма: ${e.message}")
-                }
-            }
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopProxy()
+            stopSelf()
+            return START_NOT_STICKY
         }
+        val channel = NotificationChannel(CHANNEL_ID, "Прокси", NotificationManager.IMPORTANCE_LOW)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("TG WS Proxy работает")
+            .setContentText("Прокси для Telegram: 127.0.0.1:$PORT")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setOngoing(true)
+            .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+            .addAction(0, "Стоп", PendingIntent.getService(this, 1, Intent(this, ProxyService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE))
+            .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(NOTIF_ID, notification)
+        }
+        if (server == null) startProxy()
+        // START_STICKY: если система убьёт службу, она запустится снова сама
+        return START_STICKY
     }
 
-    fun stop() {
-        server?.close()
-        sockets.forEach { runCatching { it.close() } }
-        sockets.clear()
-        pool.shutdownNow()
-    }
-
-    private fun handle(client: Socket) {
-        var ws: WebSocket? = null
+    private fun startProxy() {
+        acquireLocks()
+        val srv = MtProxyServer(PORT, hexToBytes(secretHex(this))) { ProxyState.message.value = it }
         try {
-            client.tcpNoDelay = true
-            val input = client.getInputStream()
-
-            // 1. 64 байта рукопожатия клиента: ключ, IV, тип протокола и номер DC
-            val hs = input.readExactly(64)
-            val clientDec = aes(mtKey(hs.copyOfRange(8, 40)), hs.copyOfRange(40, 56))
-            val plain = clientDec.update(hs)
-            val tag = plain.copyOfRange(56, 60)
-            if (!tag.contentEquals(TAG_ABRIDGED) && !tag.contentEquals(TAG_INTERMEDIATE) &&
-                !tag.contentEquals(TAG_PADDED)) {
-                log("Неверный секрет: удалите старый прокси в Telegram и подключите заново")
-                return
-            }
-            val dcIdx = ((plain[60].toInt() and 0xff) or (plain[61].toInt() shl 8)).toShort().toInt()
-            val media = dcIdx < 0
-            val dc = Math.abs(dcIdx)
-            val wsDc = if (dc == 203) 2 else dc
-            if (wsDc !in 1..5) {
-                log("Неизвестный номер DC: $dc")
-                return
-            }
-            log("Telegram подключился, DC $dc")
-
-            // 2. Своё рукопожатие к серверу Telegram (без секрета)
-            val raw = randomInit(tag, dcIdx)
-            val rawRev = raw.reversedArray()
-            val tgEnc = aes(raw.copyOfRange(8, 40), raw.copyOfRange(40, 56))
-            val keystream = tgEnc.update(ByteArray(64))
-            val handshake = raw.copyOf()
-            for (i in 56 until 64) handshake[i] = (raw[i].toInt() xor keystream[i].toInt()).toByte()
-            val tgDec = aes(rawRev.copyOfRange(8, 40), rawRev.copyOfRange(40, 56))
-
-            // 3. Ответы клиенту шифруем ключами из его рукопожатия, в обратном порядке
-            val rev = hs.reversedArray()
-            val cliEnc = aes(mtKey(rev.copyOfRange(8, 40)), rev.copyOfRange(40, 56))
-
-            // 4. WebSocket к серверам Telegram и отправка своего рукопожатия
-            val up = Upstream(client, cliEnc, tgDec)
-            log("Подключаюсь к серверам Telegram, DC $wsDc...")
-            val socket = connectWs(wsDc, media, up)
-            if (socket == null) {
-                log("Серверы Telegram недоступны (DC $dc)")
-                return
-            }
-            ws = socket
-            socket.send(handshake.toByteString())
-            log("Связь с серверами установлена, жду ответ Telegram")
-
-            // 5. Клиент -> Telegram
-            val buf = ByteArray(16 * 1024)
-            while (true) {
-                val n = input.read(buf)
-                if (n < 0) break
-                val chunk = clientDec.update(buf.copyOf(n)) ?: continue
-                if (!socket.send(tgEnc.update(chunk).toByteString())) break
-            }
-        } catch (e: EOFException) {
-            // клиент закрыл соединение
-        } catch (e: java.net.SocketException) {
-            // связь закрыта, причина уже записана в статус
+            srv.start()
+            server = srv
+            ProxyState.running.value = true
+            ProxyState.message.value = "Слушает 127.0.0.1:$PORT"
         } catch (e: Exception) {
-            log("Ошибка: ${e.message}")
-        } finally {
-            ws?.close(1000, null)
-            runCatching { client.close() }
-            sockets.remove(client)
+            ProxyState.message.value = "Порт $PORT недоступен: ${e.message}"
+            releaseLocks()
+            stopSelf()
         }
     }
 
-    private fun connectWs(dc: Int, media: Boolean, up: Upstream): WebSocket? {
-        val hosts = if (media) listOf("kws$dc-1", "kws$dc") else listOf("kws$dc", "kws$dc-1")
-        for (host in hosts) {
-            val req = Request.Builder()
-                .url("https://$host.web.telegram.org/apiws")
-                .header("Sec-WebSocket-Protocol", "binary")
-                .header("Origin", "https://web.telegram.org")
-                .header("User-Agent", UA)
-                .build()
-            val ws = http.newWebSocket(req, up)
-            up.opened.await(10, TimeUnit.SECONDS)
-            if (up.isOpen) return ws
-            ws.cancel()
+    // Не даём процессору и Wi-Fi уснуть, пока работает прокси
+    private fun acquireLocks() {
+        if (wakeLock == null) {
+            wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TgWsProxy:cpu")
+                .apply { setReferenceCounted(false); acquire() }
         }
-        return null
-    }
-
-    private inner class Upstream(
-        private val client: Socket,
-        private val cliEnc: Cipher,
-        private val tgDec: Cipher
-    ) : WebSocketListener() {
-        val opened = CountDownLatch(1)
-        @Volatile var isOpen = false
-        private var gotData = false
-
-        override fun onOpen(webSocket: WebSocket, response: Response) {
-            isOpen = true
-            opened.countDown()
-        }
-
-        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            if (!gotData) {
-                gotData = true
-                log("Telegram отвечает, соединение рабочее")
-            }
-            try {
-                val plain = tgDec.update(bytes.toByteArray()) ?: return
-                val out = cliEnc.update(plain) ?: return
-                client.getOutputStream().apply { write(out); flush() }
-            } catch (e: Exception) {
-                log("Ошибка данных: ${e.message}")
-                webSocket.close(1000, null)
-                runCatching { client.close() }
-            }
-        }
-
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            opened.countDown()
-            if (isOpen) {
-                log("Сервер Telegram оборвал связь: ${t.message}")
-                runCatching { client.close() }
-            } else {
-                log("Нет связи с сервером Telegram: ${t.message}")
-            }
-        }
-
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (isOpen) {
-                log("Сервер Telegram закрыл связь: код $code, $reason")
-                runCatching { client.close() }
-            }
+        if (wifiLock == null) {
+            wifiLock = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
+                .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "TgWsProxy:wifi")
+                .apply { setReferenceCounted(false); acquire() }
         }
     }
 
-    private fun randomInit(tag: ByteArray, dcIdx: Int): ByteArray {
-        while (true) {
-            val b = ByteArray(64).also { rnd.nextBytes(it) }
-            val first4 = b.copyOfRange(0, 4)
-            val reserved = b[0] == 0xEF.toByte() ||
-                first4.contentEquals(TAG_INTERMEDIATE) || first4.contentEquals(TAG_PADDED) ||
-                String(first4, Charsets.ISO_8859_1) in setOf("POST", "GET ", "HEAD", "\u0016\u0003\u0001\u0002") ||
-                b.copyOfRange(4, 8).all { it == 0.toByte() }
-            if (reserved) continue
-            tag.copyInto(b, 56)
-            b[60] = (dcIdx and 0xff).toByte()
-            b[61] = ((dcIdx shr 8) and 0xff).toByte()
-            return b
-        }
+    private fun releaseLocks() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+        wifiLock = null
     }
 
-    private fun aes(key: ByteArray, iv: ByteArray): Cipher =
-        Cipher.getInstance("AES/CTR/NoPadding").apply {
-            init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+    private fun stopProxy() {
+        server?.stop()
+        server = null
+        releaseLocks()
+        ProxyState.running.value = false
+        ProxyState.message.value = "Остановлен"
+    }
+
+    override fun onDestroy() {
+        stopProxy()
+        super.onDestroy()
+    }
+
+    companion object {
+        const val ACTION_STOP = "com.example.tgproxy.STOP"
+        const val PORT = 1443
+        private const val CHANNEL_ID = "proxy"
+        private const val NOTIF_ID = 1
+
+        fun secretHex(ctx: Context): String {
+            val prefs = ctx.getSharedPreferences("tgproxy", Context.MODE_PRIVATE)
+            return prefs.getString("secret", null) ?: ByteArray(16).also { SecureRandom().nextBytes(it) }
+                .joinToString("") { "%02x".format(it) }
+                .also { prefs.edit().putString("secret", it).apply() }
         }
 
-    private fun mtKey(seed: ByteArray): ByteArray =
-        MessageDigest.getInstance("SHA-256").digest(seed + secret)
-}
+        fun proxyLink(ctx: Context) = "tg://proxy?server=127.0.0.1&port=$PORT&secret=" + secretHex(ctx)
 
-private fun InputStream.readExactly(n: Int): ByteArray {
-    val b = ByteArray(n)
-    var off = 0
-    while (off < n) {
-        val r = read(b, off, n - off)
-        if (r < 0) throw EOFException("Соединение закрыто")
-        off += r
+        fun hexToBytes(hex: String) = ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
     }
-    return b
 }
