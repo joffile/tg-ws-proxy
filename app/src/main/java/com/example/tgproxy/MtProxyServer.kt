@@ -66,6 +66,7 @@ class MtProxyServer(
         .dns(telegramDns)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
+        .pingInterval(20, TimeUnit.SECONDS)
         .build()
     private var server: ServerSocket? = null
 
@@ -155,6 +156,8 @@ class MtProxyServer(
             }
         } catch (e: EOFException) {
             // клиент закрыл соединение
+        } catch (e: java.net.SocketException) {
+            // связь закрыта, причина уже записана в статус
         } catch (e: Exception) {
             log("Ошибка: ${e.message}")
         } finally {
@@ -214,6 +217,7 @@ class MtProxyServer(
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             opened.countDown()
             if (isOpen) {
+                log("Сервер Telegram оборвал связь: ${t.message}")
                 runCatching { client.close() }
             } else {
                 log("Нет связи с сервером Telegram: ${t.message}")
@@ -221,7 +225,10 @@ class MtProxyServer(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (isOpen) runCatching { client.close() }
+            if (isOpen) {
+                log("Сервер Telegram закрыл связь: код $code, $reason")
+                runCatching { client.close() }
+            }
         }
     }
 
